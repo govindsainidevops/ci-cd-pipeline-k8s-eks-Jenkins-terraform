@@ -36,6 +36,6 @@ resource "null_resource" "prevent_eks_destroy" {
   }
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
