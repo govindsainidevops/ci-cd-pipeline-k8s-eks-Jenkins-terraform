@@ -1,5 +1,3 @@
-# ci-cd-pipeline-k8s-eks-Jenkins-terraform
-
 # 🚀 CI/CD Pipeline — Jenkins + Terraform + AWS EKS
 
 A production-style, fully automated DevOps pipeline that provisions AWS infrastructure with Terraform and deploys a containerised Python app to Kubernetes on EKS via Jenkins.
@@ -28,7 +26,7 @@ Developer Push
 GitHub Repository
       ↓
 Jenkins Pipeline
-      ├── Terraform Init / Plan / Apply
+      ├── Terraform Init / Validate / Plan / Apply
       │       └── VPC + Subnets + NAT Gateway
       │       └── EKS Cluster + Node Group
       │       └── Amazon ECR Repository
@@ -58,14 +56,14 @@ HPA Auto Scaling
 ├── app/
 │   └── app.py                      # Python Flask application
 ├── terraform/
-│   ├── main.tf                     # Provider config, backend
+│   ├── main.tf                     # Provider config, optional S3 backend
 │   ├── variables.tf                # Input variables
 │   ├── outputs.tf                  # Cluster endpoint, ECR URL
 │   ├── vpc.tf                      # VPC, subnets, NAT gateway
 │   ├── eks.tf                      # EKS cluster + node group
-│   ├── ecr.tf                      # ECR repository + lifecycle
-│   └── iam.tf                      # IAM roles
+│   └── ecr.tf                      # ECR repository + lifecycle policy
 ├── Dockerfile
+├── .dockerignore                   # Excludes terraform/ from build context
 ├── Jenkinsfile
 ├── k8s-deployment.yaml
 ├── hpa.yaml
@@ -82,13 +80,13 @@ HPA Auto Scaling
 
 Install the following on your local machine and inside the Jenkins container:
 
-| Tool | Purpose | Install |
-|---|---|---|
-| AWS CLI | AWS authentication | [docs.aws.amazon.com](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) |
-| Terraform >= 1.7 | Infrastructure provisioning | [developer.hashicorp.com](https://developer.hashicorp.com/terraform/install) |
-| kubectl | Kubernetes CLI | [kubernetes.io](https://kubernetes.io/docs/tasks/tools/) |
-| Docker Desktop | Container runtime | [docker.com](https://www.docker.com/products/docker-desktop/) |
-| Jenkins | CI/CD server | Running via Docker (see Phase 1) |
+| Tool | Purpose |
+|---|---|
+| AWS CLI | AWS authentication |
+| Terraform >= 1.7 | Infrastructure provisioning |
+| kubectl | Kubernetes CLI |
+| Docker Desktop | Container runtime |
+| Jenkins | CI/CD server (run via Docker) |
 
 ---
 
@@ -163,18 +161,18 @@ Go to **Manage Jenkins → Credentials → System → Global Credentials → Add
 ```bash
 docker exec -it jenkins bash
 
-# Install kubectl
+# kubectl
 curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
 chmod +x kubectl && mv kubectl /usr/local/bin/
 kubectl version --client
 
-# Install AWS CLI
+# AWS CLI
 apt update && apt install -y curl unzip
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 unzip awscliv2.zip && ./aws/install
 aws --version
 
-# Install Terraform
+# Terraform
 apt install -y wget
 wget https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip
 unzip terraform_1.7.5_linux_amd64.zip && mv terraform /usr/local/bin/
@@ -220,7 +218,7 @@ terraform {
     }
   }
 
-  # Recommended for teams: remote state in S3
+  # Recommended for teams: remote state in S3 + DynamoDB lock
   # backend "s3" {
   #   bucket         = "your-terraform-state-bucket"
   #   key            = "eks/terraform.tfstate"
@@ -291,14 +289,22 @@ module "eks" {
     }
   }
 
-  # Prevent accidental cluster deletion
-  lifecycle {
-    prevent_destroy = true
-  }
-
   tags = {
     Environment = "dev"
     Project     = "devops-pipeline"
+  }
+}
+
+# Accidental deletion guard.
+# lifecycle blocks are NOT valid inside module{} — this null_resource is the correct pattern.
+# To intentionally destroy the cluster, remove this resource first, then run terraform destroy.
+resource "null_resource" "prevent_eks_destroy" {
+  triggers = {
+    cluster_name = module.eks.cluster_name
+  }
+
+  lifecycle {
+    prevent_destroy = true
   }
 }
 ```
@@ -357,7 +363,7 @@ output "configure_kubectl" {
 
 ## ⚡ Phase 4 — Handling Existing Infrastructure
 
-Terraform is **idempotent** — running `terraform apply` repeatedly is safe. It only changes what has drifted from your configuration. The pipeline handles all three scenarios automatically:
+Terraform is **idempotent** — running `terraform apply` repeatedly is always safe. It only changes what has drifted from your configuration.
 
 ### Scenario A: Infrastructure does not exist yet
 
@@ -365,7 +371,7 @@ Terraform is **idempotent** — running `terraform apply` repeatedly is safe. It
 
 ### Scenario B: Infrastructure already exists (created by Terraform)
 
-`terraform plan` compares your `.tf` files against the Terraform state file. If nothing has changed, it outputs:
+`terraform plan` compares your `.tf` files against the Terraform state file. If nothing has changed:
 
 ```
 No changes. Your infrastructure matches the configuration.
@@ -375,7 +381,7 @@ The Apply stage completes in seconds with no side effects.
 
 ### Scenario C: Infrastructure exists but was created manually (eksctl / console)
 
-Terraform is unaware of resources it did not create. Use `terraform import` to adopt them:
+Terraform is unaware of resources it did not create. Import them first:
 
 ```bash
 cd terraform/
@@ -383,17 +389,17 @@ terraform import module.eks.aws_eks_cluster.this devops-cluster
 terraform import aws_ecr_repository.app devops-app
 ```
 
-After importing, run `terraform plan` to detect any config drift between your `.tf` files and the real infrastructure, then apply to reconcile.
+Then run `terraform plan` to detect config drift and `terraform apply` to reconcile.
 
 ### Scenario D: Someone manually changed a resource (drift)
 
-`terraform plan` detects the change and shows a diff. For example, if a node group was manually scaled from 2 to 4, Terraform will flag it and offer to revert to the value in your `.tf` file.
+`terraform plan` detects and shows the diff. Apply to revert it back to the declared configuration.
 
 ### Scenario E: A previous apply failed partway through
 
 Terraform's state file tracks what was already created. Re-running `terraform apply` resumes from the failure point — already-created resources are not recreated.
 
-> **Note:** The `prevent_destroy = true` lifecycle rule on the EKS cluster in `eks.tf` acts as a safety net — `terraform destroy` will error out on the cluster itself, preventing accidental teardown.
+> **Safety net:** The `null_resource.prevent_eks_destroy` in `eks.tf` prevents accidental `terraform destroy` of the EKS cluster. To intentionally destroy, remove that resource first.
 
 ---
 
@@ -406,10 +412,10 @@ cd terraform/
 terraform init
 
 # Preview everything that will be created
-terraform plan -out=tfplan
+terraform plan -no-color -out=tfplan
 
-# Apply (first run ~15 min, subsequent runs are near-instant if no changes)
-terraform apply tfplan
+# Apply (~15 min on first run, near-instant on subsequent runs if no changes)
+terraform apply -no-color tfplan
 
 # Configure kubectl to connect to the new cluster
 $(terraform output -raw configure_kubectl)
@@ -422,8 +428,6 @@ kubectl get nodes
 
 ## 🔌 Phase 6 — Jenkinsfile
 
-Replace the `Jenkinsfile` in the root of your repo with this version:
-
 ```groovy
 pipeline {
 
@@ -432,9 +436,6 @@ pipeline {
     environment {
         AWS_REGION   = "us-east-1"
         CLUSTER_NAME = "devops-cluster"
-        ECR_REPO     = sh(returnStdout: true, script: '''
-            cd terraform && terraform output -raw ecr_repository_url
-        ''').trim()
         IMAGE_TAG    = "${env.BUILD_NUMBER}"
     }
 
@@ -454,7 +455,8 @@ pipeline {
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     dir('terraform') {
-                        sh 'terraform init -input=false'
+                        // -no-color prevents ANSI escape codes polluting output
+                        sh 'terraform init -input=false -no-color'
                         sh 'terraform fmt -check'
                         sh 'terraform validate'
                     }
@@ -469,25 +471,23 @@ pipeline {
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     dir('terraform') {
-                        // Safe to run on every build — no-op if infra already matches
-                        sh 'terraform plan -input=false -out=tfplan'
+                        sh 'terraform plan -input=false -no-color -out=tfplan'
                     }
                 }
             }
         }
 
         stage('Terraform Apply') {
-            when {
-                branch 'main'
-            }
+            // Note: no `when { branch 'main' }` — branch detection is unreliable
+            // with SCM polling + detached HEAD. The job itself is scoped to main.
+            // Idempotent: no-op if infrastructure already matches config.
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     dir('terraform') {
-                        // Idempotent: skips if infra already exists and matches
-                        sh 'terraform apply -input=false tfplan'
+                        sh 'terraform apply -input=false -no-color tfplan'
                     }
                 }
             }
@@ -495,7 +495,7 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                sh "docker build -t devops-app:${IMAGE_TAG} ."
+                sh "docker build -t devops-app:${env.IMAGE_TAG} ."
             }
         }
 
@@ -505,16 +505,27 @@ pipeline {
                     $class: 'AmazonWebServicesCredentialsBinding',
                     credentialsId: 'eks-aws-creds'
                 ]]) {
-                    sh """
-                        aws ecr get-login-password --region ${AWS_REGION} \
-                          | docker login --username AWS --password-stdin ${ECR_REPO}
+                    script {
+                        // Resolve ECR URL after terraform apply.
+                        // -no-color is required to prevent ANSI codes corrupting the URL.
+                        def ecrRepo = sh(
+                            returnStdout: true,
+                            script: 'cd terraform && terraform output -no-color -raw ecr_repository_url'
+                        ).trim()
 
-                        docker tag devops-app:${IMAGE_TAG} ${ECR_REPO}:${IMAGE_TAG}
-                        docker tag devops-app:${IMAGE_TAG} ${ECR_REPO}:latest
+                        sh """
+                            aws ecr get-login-password --region ${env.AWS_REGION} \
+                              | docker login --username AWS --password-stdin ${ecrRepo}
 
-                        docker push ${ECR_REPO}:${IMAGE_TAG}
-                        docker push ${ECR_REPO}:latest
-                    """
+                            docker tag devops-app:${env.IMAGE_TAG} ${ecrRepo}:${env.IMAGE_TAG}
+                            docker tag devops-app:${env.IMAGE_TAG} ${ecrRepo}:latest
+
+                            docker push ${ecrRepo}:${env.IMAGE_TAG}
+                            docker push ${ecrRepo}:latest
+                        """
+
+                        env.ECR_REPO = ecrRepo
+                    }
                 }
             }
         }
@@ -525,7 +536,7 @@ pipeline {
                     $class: 'AmazonWebServicesCredentialsBinding',
                     credentialsId: 'eks-aws-creds'
                 ]]) {
-                    sh "aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}"
+                    sh "aws eks update-kubeconfig --region ${env.AWS_REGION} --name ${env.CLUSTER_NAME}"
                 }
             }
         }
@@ -533,7 +544,7 @@ pipeline {
         stage('Deploy to EKS') {
             steps {
                 sh """
-                    sed -i 's|:latest|:${IMAGE_TAG}|g' k8s-deployment.yaml
+                    sed -i 's|:latest|:${env.IMAGE_TAG}|g' k8s-deployment.yaml
 
                     kubectl apply -f k8s-deployment.yaml
                     kubectl apply -f hpa.yaml
@@ -547,19 +558,17 @@ pipeline {
 
         stage('Install Metrics Server') {
             steps {
-                sh """
-                    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-                """
+                sh 'kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml'
             }
         }
 
         stage('Verify Deployment') {
             steps {
-                sh """
+                sh '''
                     kubectl get pods
                     kubectl get svc
                     kubectl get hpa
-                """
+                '''
             }
         }
     }
@@ -572,7 +581,8 @@ pipeline {
             echo "❌ Deployment failed at stage: ${env.STAGE_NAME}"
         }
         always {
-            sh "docker rmi devops-app:${IMAGE_TAG} || true"
+            // Use env.BUILD_NUMBER directly — IMAGE_TAG may not resolve if pipeline failed early
+            sh "docker rmi devops-app:${env.BUILD_NUMBER} || true"
         }
     }
 }
@@ -580,7 +590,26 @@ pipeline {
 
 ---
 
-## 🔗 Phase 7 — Create Jenkins Pipeline Job
+## 🚫 Phase 7 — .dockerignore
+
+Create this file at the **repo root**. Without it, Docker sends ~780 MB of unnecessary files to the build daemon on every run.
+
+```
+terraform/
+.terraform/
+*.tfstate
+*.tfstate.backup
+tfplan
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.env
+```
+
+---
+
+## 🔗 Phase 8 — Create Jenkins Pipeline Job
 
 1. Go to **Jenkins Dashboard → New Item**
 2. Choose **Pipeline**, give it a name, click OK
@@ -595,26 +624,26 @@ The pipeline executes all stages in order:
 
 ```
 Checkout → Terraform Init/Validate → Terraform Plan → Terraform Apply
-  → Docker Build → ECR Push → Configure EKS → Deploy to EKS
+  → Docker Build → Push to ECR → Configure EKS → Deploy to EKS
   → Metrics Server → Verify
 ```
 
 ---
 
-## 📊 Phase 8 — Monitoring Setup
+## 📊 Phase 9 — Monitoring Setup
 
 ### Access Prometheus
 
 ```bash
 kubectl get svc prometheus-service
-# Copy the EXTERNAL-IP and open in browser on port 9090
+# Open EXTERNAL-IP:9090 in browser
 ```
 
 ### Access Grafana
 
 ```bash
 kubectl get svc grafana-service
-# Copy the EXTERNAL-IP and open in browser on port 3000
+# Open EXTERNAL-IP:3000 in browser
 ```
 
 Default Grafana credentials: `admin` / `admin`
@@ -627,25 +656,16 @@ URL: http://prometheus-service:9090
 
 ---
 
-## 📈 Phase 9 — Test Auto Scaling
-
-Install the Metrics Server if not already done:
+## 📈 Phase 10 — Test Auto Scaling
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-kubectl top nodes
-kubectl top pods
-```
-
-Generate load to trigger HPA:
-
-```bash
+# Generate load
 kubectl run -i --tty load-generator --image=busybox -- sh
 # Inside the container:
 while true; do wget -q -O- http://devops-service; done
 ```
 
-Watch scaling in action:
+Watch scaling in real time:
 
 ```bash
 kubectl get hpa -w
@@ -656,7 +676,7 @@ kubectl get pods -w
 
 ## 🔄 Rollback
 
-Because images are tagged with `BUILD_NUMBER` (not `latest`), you can roll back instantly:
+Images are tagged with `BUILD_NUMBER`, enabling instant rollbacks:
 
 ```bash
 # Roll back to the previous deployment
@@ -671,13 +691,13 @@ kubectl set image deployment/devops-app devops-app=<ECR_URL>/devops-app:42
 ## 💰 Cleanup
 
 ```bash
-# Remove Kubernetes resources first
+# 1. Remove Kubernetes resources
 kubectl delete -f k8s-deployment.yaml
 kubectl delete -f prometheus-deployment.yaml
 kubectl delete -f grafana-deployment.yaml
 kubectl delete -f hpa.yaml
 
-# Remove prevent_destroy from eks.tf, then destroy all infrastructure
+# 2. Remove the prevent_destroy guard from terraform/eks.tf, then:
 cd terraform/
 terraform destroy -auto-approve
 
@@ -688,7 +708,48 @@ terraform destroy -auto-approve
 # ✓ IAM roles and policies
 ```
 
-> **Before running destroy:** comment out or remove the `prevent_destroy = true` block in `terraform/eks.tf`, otherwise Terraform will error on the cluster deletion.
+> **Before running destroy:** remove the `null_resource "prevent_eks_destroy"` block from `terraform/eks.tf`, otherwise Terraform will error on cluster deletion.
+
+---
+
+## 🛠️ Troubleshooting
+
+**Terraform Apply skipped in Jenkins**
+
+Remove any `when { branch 'main' }` conditions — branch detection is unreliable with SCM polling on a detached HEAD. Scope the branch via the Jenkins job configuration instead.
+
+**ECR URL contains garbled characters / ANSI codes**
+
+Always pass `-no-color` to every Terraform command in CI:
+
+```bash
+terraform plan    -no-color
+terraform apply   -no-color
+terraform output  -no-color -raw ecr_repository_url
+```
+
+**Docker build context is very large (~780 MB)**
+
+Ensure `.dockerignore` exists at the repo root with `terraform/` and `.terraform/` listed.
+
+**kubectl can't connect to cluster**
+
+```bash
+aws eks update-kubeconfig --region us-east-1 --name devops-cluster
+```
+
+**ECR push denied**
+
+```bash
+aws ecr get-login-password --region us-east-1 \
+  | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
+```
+
+**HPA shows `<unknown>` for CPU**
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+```
 
 ---
 
@@ -702,9 +763,10 @@ terraform destroy -auto-approve
 | Drift detection | No | `terraform plan` shows drift |
 | Partial failure recovery | Manual | Automatic resume |
 | Existing infra import | Not applicable | `terraform import` |
-| Accidental deletion guard | None | `prevent_destroy = true` |
+| Accidental deletion guard | None | `null_resource` with `prevent_destroy` |
 | Cleanup | Manual per-resource | `terraform destroy` |
 | Team collaboration | Hard | S3 remote state + DynamoDB lock |
+| ANSI-safe CI output | N/A | `-no-color` on all commands |
 
 ---
 
@@ -714,37 +776,9 @@ terraform destroy -auto-approve
 - [ ] ArgoCD for GitOps-style deployments
 - [ ] SonarQube code quality gate in pipeline
 - [ ] Trivy container image security scanning
-- [ ] Slack notifications on pipeline success/failure
+- [ ] Slack notifications on pipeline success / failure
 - [ ] Blue-Green deployment strategy
 - [ ] S3 + DynamoDB remote Terraform state for team use
-
----
-
-## 🛠️ Troubleshooting
-
-**kubectl can't connect to cluster**
-```bash
-aws eks update-kubeconfig --region us-east-1 --name devops-cluster
-```
-
-**Terraform plan shows unexpected changes**
-```bash
-# Review the diff carefully before applying
-terraform plan -detailed-exitcode
-```
-
-**ECR push denied**
-```bash
-# Re-authenticate Docker to ECR
-aws ecr get-login-password --region us-east-1 \
-  | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
-```
-
-**HPA shows `<unknown>` for CPU**
-```bash
-# Metrics server is likely not running
-kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-```
 
 ---
 
