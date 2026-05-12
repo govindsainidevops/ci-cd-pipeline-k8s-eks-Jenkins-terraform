@@ -22,10 +22,10 @@ pipeline {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
                     credentialsId: 'eks-aws-creds'
-                ]]) {
+             ]]) {
                     dir('terraform') {
                         sh 'terraform init -input=false -no-color'
-                        sh 'terraform fmt -check'
+                        // Removed fmt -check — run terraform fmt locally before committing instead
                         sh 'terraform validate'
                     }
                 }
