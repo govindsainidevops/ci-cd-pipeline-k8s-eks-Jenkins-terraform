@@ -5,8 +5,6 @@ pipeline {
     environment {
         AWS_REGION   = "us-east-1"
         CLUSTER_NAME = "devops-cluster"
-        // Do NOT call terraform output here — Terraform may not be initialised yet
-        // ECR_REPO is resolved lazily in the Push stage instead
         IMAGE_TAG    = "${env.BUILD_NUMBER}"
     }
 
@@ -26,7 +24,7 @@ pipeline {
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     dir('terraform') {
-                        sh 'terraform init -input=false'
+                        sh 'terraform init -input=false -no-color'
                         sh 'terraform fmt -check'
                         sh 'terraform validate'
                     }
@@ -41,23 +39,23 @@ pipeline {
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     dir('terraform') {
-                        sh 'terraform plan -input=false -out=tfplan'
+                        sh 'terraform plan -input=false -no-color -out=tfplan'
                     }
                 }
             }
         }
 
         stage('Terraform Apply') {
-            when {
-                branch 'main'
-            }
+            // Removed: when { branch 'main' }
+            // Branch detection is unreliable with SCM polling + detached HEAD.
+            // Pipeline is already scoped to the main branch via the job config.
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     dir('terraform') {
-                        sh 'terraform apply -input=false tfplan'
+                        sh 'terraform apply -input=false -no-color tfplan'
                     }
                 }
             }
@@ -76,10 +74,10 @@ pipeline {
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     script {
-                        // Resolve ECR URL here — after terraform apply has run
+                        // -no-color prevents ANSI escape codes polluting the URL
                         def ecrRepo = sh(
                             returnStdout: true,
-                            script: 'cd terraform && terraform output -raw ecr_repository_url'
+                            script: 'cd terraform && terraform output -no-color -raw ecr_repository_url'
                         ).trim()
 
                         sh """
@@ -93,7 +91,6 @@ pipeline {
                             docker push ${ecrRepo}:latest
                         """
 
-                        // Store for downstream stages
                         env.ECR_REPO = ecrRepo
                     }
                 }
@@ -151,7 +148,6 @@ pipeline {
             echo "❌ Deployment failed at stage: ${env.STAGE_NAME}"
         }
         always {
-            // Use env.BUILD_NUMBER directly — IMAGE_TAG may not be set if pipeline failed early
             sh "docker rmi devops-app:${env.BUILD_NUMBER} || true"
         }
     }
