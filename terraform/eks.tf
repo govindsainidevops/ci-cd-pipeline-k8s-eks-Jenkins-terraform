@@ -22,13 +22,20 @@ module "eks" {
     }
   }
 
-  # Prevent accidental cluster deletion
-  lifecycle {
-    prevent_destroy = true
-  }
-
+  # lifecycle block is NOT valid inside module{} — use a null_resource guard instead
   tags = {
     Environment = "dev"
     Project     = "devops-pipeline"
+  }
+}
+
+# Accidental deletion guard — destroying this resource will fail with a clear message
+resource "null_resource" "prevent_eks_destroy" {
+  triggers = {
+    cluster_name = module.eks.cluster_name
+  }
+
+  lifecycle {
+    prevent_destroy = true
   }
 }

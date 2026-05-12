@@ -1,12 +1,12 @@
 pipeline {
+
     agent any
 
     environment {
         AWS_REGION   = "us-east-1"
         CLUSTER_NAME = "devops-cluster"
-        ECR_REPO     = sh(returnStdout: true, script: '''
-            cd terraform && terraform output -raw ecr_repository_url
-        ''').trim()
+        // Do NOT call terraform output here — Terraform may not be initialised yet
+        // ECR_REPO is resolved lazily in the Push stage instead
         IMAGE_TAG    = "${env.BUILD_NUMBER}"
     }
 
@@ -41,7 +41,6 @@ pipeline {
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     dir('terraform') {
-                        // Safe to run on every build — no-op if infra already matches
                         sh 'terraform plan -input=false -out=tfplan'
                     }
                 }
@@ -58,7 +57,6 @@ pipeline {
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     dir('terraform') {
-                        // Idempotent: skips if infra already exists and matches
                         sh 'terraform apply -input=false tfplan'
                     }
                 }
@@ -67,7 +65,7 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                sh "docker build -t devops-app:${IMAGE_TAG} ."
+                sh "docker build -t devops-app:${env.IMAGE_TAG} ."
             }
         }
 
@@ -77,16 +75,27 @@ pipeline {
                     $class: 'AmazonWebServicesCredentialsBinding',
                     credentialsId: 'eks-aws-creds'
                 ]]) {
-                    sh """
-                        aws ecr get-login-password --region ${AWS_REGION} \
-                          | docker login --username AWS --password-stdin ${ECR_REPO}
+                    script {
+                        // Resolve ECR URL here — after terraform apply has run
+                        def ecrRepo = sh(
+                            returnStdout: true,
+                            script: 'cd terraform && terraform output -raw ecr_repository_url'
+                        ).trim()
 
-                        docker tag devops-app:${IMAGE_TAG} ${ECR_REPO}:${IMAGE_TAG}
-                        docker tag devops-app:${IMAGE_TAG} ${ECR_REPO}:latest
+                        sh """
+                            aws ecr get-login-password --region ${env.AWS_REGION} \
+                              | docker login --username AWS --password-stdin ${ecrRepo}
 
-                        docker push ${ECR_REPO}:${IMAGE_TAG}
-                        docker push ${ECR_REPO}:latest
-                    """
+                            docker tag devops-app:${env.IMAGE_TAG} ${ecrRepo}:${env.IMAGE_TAG}
+                            docker tag devops-app:${env.IMAGE_TAG} ${ecrRepo}:latest
+
+                            docker push ${ecrRepo}:${env.IMAGE_TAG}
+                            docker push ${ecrRepo}:latest
+                        """
+
+                        // Store for downstream stages
+                        env.ECR_REPO = ecrRepo
+                    }
                 }
             }
         }
@@ -97,7 +106,7 @@ pipeline {
                     $class: 'AmazonWebServicesCredentialsBinding',
                     credentialsId: 'eks-aws-creds'
                 ]]) {
-                    sh "aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}"
+                    sh "aws eks update-kubeconfig --region ${env.AWS_REGION} --name ${env.CLUSTER_NAME}"
                 }
             }
         }
@@ -105,7 +114,7 @@ pipeline {
         stage('Deploy to EKS') {
             steps {
                 sh """
-                    sed -i 's|:latest|:${IMAGE_TAG}|g' k8s-deployment.yaml
+                    sed -i 's|:latest|:${env.IMAGE_TAG}|g' k8s-deployment.yaml
 
                     kubectl apply -f k8s-deployment.yaml
                     kubectl apply -f hpa.yaml
@@ -119,19 +128,17 @@ pipeline {
 
         stage('Install Metrics Server') {
             steps {
-                sh """
-                    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-                """
+                sh 'kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml'
             }
         }
 
         stage('Verify Deployment') {
             steps {
-                sh """
+                sh '''
                     kubectl get pods
                     kubectl get svc
                     kubectl get hpa
-                """
+                '''
             }
         }
     }
@@ -144,7 +151,8 @@ pipeline {
             echo "❌ Deployment failed at stage: ${env.STAGE_NAME}"
         }
         always {
-            sh "docker rmi devops-app:${IMAGE_TAG} || true"
+            // Use env.BUILD_NUMBER directly — IMAGE_TAG may not be set if pipeline failed early
+            sh "docker rmi devops-app:${env.BUILD_NUMBER} || true"
         }
     }
 }
