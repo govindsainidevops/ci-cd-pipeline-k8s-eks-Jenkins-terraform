@@ -78,8 +78,6 @@ HPA Auto Scaling
 
 ## ✅ Prerequisites
 
-Install the following on your local machine and inside the Jenkins container:
-
 | Tool | Purpose |
 |---|---|
 | AWS CLI | AWS authentication |
@@ -167,13 +165,12 @@ chmod +x kubectl && mv kubectl /usr/local/bin/
 kubectl version --client
 
 # AWS CLI
-apt update && apt install -y curl unzip
+apt update && apt install -y curl unzip wget
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 unzip awscliv2.zip && ./aws/install
 aws --version
 
 # Terraform
-apt install -y wget
 wget https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip
 unzip terraform_1.7.5_linux_amd64.zip && mv terraform /usr/local/bin/
 terraform version
@@ -192,6 +189,10 @@ variable "region" {
 
 variable "cluster_name" {
   default = "devops-cluster"
+}
+
+variable "cluster_version" {
+  default = "1.31" # Single place to control EKS version
 }
 
 variable "ecr_repo_name" {
@@ -270,7 +271,7 @@ module "eks" {
   version = "~> 20.0"
 
   cluster_name    = var.cluster_name
-  cluster_version = "1.29"
+  cluster_version = var.cluster_version
 
   vpc_id                         = module.vpc.vpc_id
   subnet_ids                     = module.vpc.private_subnets
@@ -297,7 +298,7 @@ module "eks" {
 
 # Accidental deletion guard.
 # lifecycle blocks are NOT valid inside module{} — this null_resource is the correct pattern.
-# To intentionally destroy the cluster, remove this resource first, then run terraform destroy.
+# To intentionally destroy the cluster, comment this out first, then run terraform destroy.
 resource "null_resource" "prevent_eks_destroy" {
   triggers = {
     cluster_name = module.eks.cluster_name
@@ -371,7 +372,7 @@ Terraform is **idempotent** — running `terraform apply` repeatedly is always s
 
 ### Scenario B: Infrastructure already exists (created by Terraform)
 
-`terraform plan` compares your `.tf` files against the Terraform state file. If nothing has changed:
+`terraform plan` compares your `.tf` files against the Terraform state file. If nothing changed:
 
 ```
 No changes. Your infrastructure matches the configuration.
@@ -381,7 +382,7 @@ The Apply stage completes in seconds with no side effects.
 
 ### Scenario C: Infrastructure exists but was created manually (eksctl / console)
 
-Terraform is unaware of resources it did not create. Import them first:
+Terraform is unaware of resources it did not create. Import them:
 
 ```bash
 cd terraform/
@@ -389,24 +390,77 @@ terraform import module.eks.aws_eks_cluster.this devops-cluster
 terraform import aws_ecr_repository.app devops-app
 ```
 
-Then run `terraform plan` to detect config drift and `terraform apply` to reconcile.
+Alternatively, delete the manually created resources from the AWS console and let Terraform recreate them cleanly — this is the simpler approach when nothing is deployed yet.
 
-### Scenario D: Someone manually changed a resource (drift)
+### Scenario D: Drift — someone manually changed a resource
 
-`terraform plan` detects and shows the diff. Apply to revert it back to the declared configuration.
+`terraform plan` detects and shows the diff. Apply to revert it back to declared configuration.
 
 ### Scenario E: A previous apply failed partway through
 
-Terraform's state file tracks what was already created. Re-running `terraform apply` resumes from the failure point — already-created resources are not recreated.
+Terraform's state file tracks what was already created. Re-running `terraform apply` resumes from the failure point.
 
-> **Safety net:** The `null_resource.prevent_eks_destroy` in `eks.tf` prevents accidental `terraform destroy` of the EKS cluster. To intentionally destroy, remove that resource first.
+> **Safety net:** `null_resource.prevent_eks_destroy` in `eks.tf` prevents accidental `terraform destroy` of the EKS cluster. Comment it out before intentionally destroying.
 
 ---
 
-## ▶️ Phase 5 — First-Time Infrastructure Provisioning
+## ⬆️ Phase 5 — EKS Version Upgrade Policy
+
+> **Critical:** AWS EKS does **not allow skipping minor versions**. You must upgrade one step at a time.
+
+### Correct upgrade path
+
+```
+1.29 → 1.30 → 1.31    ✅ correct (one minor version at a time)
+1.29 → 1.31            ❌ fails with InvalidParameterException
+```
+
+### How to upgrade
+
+**Step 1:** Update `cluster_version` in `variables.tf` to the next minor version:
+
+```hcl
+variable "cluster_version" {
+  default = "1.30"
+}
+```
+
+Commit, push, wait for pipeline to complete (~10 min).
+
+**Step 2:** Update to the next version:
+
+```hcl
+variable "cluster_version" {
+  default = "1.31"
+}
+```
+
+Commit, push, wait for pipeline to complete.
+
+### Starting fresh at a higher version (when nothing is deployed)
+
+If you have no workloads running, it's faster to destroy and recreate:
+
+```bash
+# 1. Comment out null_resource.prevent_eks_destroy in eks.tf
+# 2. Run destroy
+cd terraform/
+terraform destroy -auto-approve -no-color
+
+# 3. Set cluster_version = "1.31" in variables.tf
+# 4. Restore null_resource.prevent_eks_destroy
+# 5. Commit and push — pipeline recreates everything at 1.31
+```
+
+---
+
+## ▶️ Phase 6 — First-Time Infrastructure Provisioning
 
 ```bash
 cd terraform/
+
+# Always run fmt before committing to avoid pipeline failures
+terraform fmt
 
 # Download providers and modules
 terraform init
@@ -426,7 +480,26 @@ kubectl get nodes
 
 ---
 
-## 🔌 Phase 6 — Jenkinsfile
+## 🚫 Phase 7 — .dockerignore
+
+Create this file at the **repo root**. Without it Docker sends ~780 MB of unnecessary files to the build daemon on every run.
+
+```
+terraform/
+.terraform/
+*.tfstate
+*.tfstate.backup
+tfplan
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.env
+```
+
+---
+
+## 🔌 Phase 8 — Jenkinsfile
 
 ```groovy
 pipeline {
@@ -455,9 +528,10 @@ pipeline {
                     credentialsId: 'eks-aws-creds'
                 ]]) {
                     dir('terraform') {
-                        // -no-color prevents ANSI escape codes polluting output
                         sh 'terraform init -input=false -no-color'
-                        sh 'terraform fmt -check'
+                        // fmt -check is intentionally removed from CI.
+                        // Run `terraform fmt` locally before every commit instead.
+                        // Add a git pre-commit hook (see Troubleshooting) to enforce this.
                         sh 'terraform validate'
                     }
                 }
@@ -478,8 +552,8 @@ pipeline {
         }
 
         stage('Terraform Apply') {
-            // Note: no `when { branch 'main' }` — branch detection is unreliable
-            // with SCM polling + detached HEAD. The job itself is scoped to main.
+            // No `when { branch 'main' }` — branch detection is unreliable
+            // with SCM polling + detached HEAD. Job is scoped to main via config.
             // Idempotent: no-op if infrastructure already matches config.
             steps {
                 withCredentials([[
@@ -507,7 +581,7 @@ pipeline {
                 ]]) {
                     script {
                         // Resolve ECR URL after terraform apply.
-                        // -no-color is required to prevent ANSI codes corrupting the URL.
+                        // -no-color is required — ANSI codes corrupt the URL string.
                         def ecrRepo = sh(
                             returnStdout: true,
                             script: 'cd terraform && terraform output -no-color -raw ecr_repository_url'
@@ -590,26 +664,7 @@ pipeline {
 
 ---
 
-## 🚫 Phase 7 — .dockerignore
-
-Create this file at the **repo root**. Without it, Docker sends ~780 MB of unnecessary files to the build daemon on every run.
-
-```
-terraform/
-.terraform/
-*.tfstate
-*.tfstate.backup
-tfplan
-.git/
-__pycache__/
-*.pyc
-*.pyo
-.env
-```
-
----
-
-## 🔗 Phase 8 — Create Jenkins Pipeline Job
+## 🔗 Phase 9 — Create Jenkins Pipeline Job
 
 1. Go to **Jenkins Dashboard → New Item**
 2. Choose **Pipeline**, give it a name, click OK
@@ -620,7 +675,7 @@ __pycache__/
 7. Set Script Path to `Jenkinsfile`
 8. Save and click **Build Now**
 
-The pipeline executes all stages in order:
+Pipeline execution order:
 
 ```
 Checkout → Terraform Init/Validate → Terraform Plan → Terraform Apply
@@ -630,7 +685,7 @@ Checkout → Terraform Init/Validate → Terraform Plan → Terraform Apply
 
 ---
 
-## 📊 Phase 9 — Monitoring Setup
+## 📊 Phase 10 — Monitoring Setup
 
 ### Access Prometheus
 
@@ -644,9 +699,8 @@ kubectl get svc prometheus-service
 ```bash
 kubectl get svc grafana-service
 # Open EXTERNAL-IP:3000 in browser
+# Default credentials: admin / admin
 ```
-
-Default Grafana credentials: `admin` / `admin`
 
 Add Prometheus as a data source:
 
@@ -656,7 +710,7 @@ URL: http://prometheus-service:9090
 
 ---
 
-## 📈 Phase 10 — Test Auto Scaling
+## 📈 Phase 11 — Test Auto Scaling
 
 ```bash
 # Generate load
@@ -697,22 +751,72 @@ kubectl delete -f prometheus-deployment.yaml
 kubectl delete -f grafana-deployment.yaml
 kubectl delete -f hpa.yaml
 
-# 2. Remove the prevent_destroy guard from terraform/eks.tf, then:
+# 2. Comment out null_resource.prevent_eks_destroy in terraform/eks.tf
+
+# 3. Destroy all infrastructure
 cd terraform/
-terraform destroy -auto-approve
+terraform destroy -auto-approve -no-color
 
 # Resources deleted:
 # ✓ EKS cluster + node group
 # ✓ VPC + subnets + NAT gateway
 # ✓ Amazon ECR repository + images
 # ✓ IAM roles and policies
+# ✓ KMS key + CloudWatch log group
 ```
-
-> **Before running destroy:** remove the `null_resource "prevent_eks_destroy"` block from `terraform/eks.tf`, otherwise Terraform will error on cluster deletion.
 
 ---
 
 ## 🛠️ Troubleshooting
+
+**`terraform fmt -check` fails in CI (exit code 3)**
+
+The pipeline fails before Plan/Apply because `eks.tf` has formatting issues. Fix:
+
+```bash
+# Run locally before committing — rewrites files in place
+cd terraform/
+terraform fmt
+
+git add -A && git commit -m "terraform fmt" && git push
+```
+
+Add a git pre-commit hook to catch this automatically:
+
+```bash
+cat > .git/hooks/pre-commit << 'EOF'
+#!/bin/sh
+terraform fmt -check terraform/
+if [ $? -ne 0 ]; then
+  echo "❌ Run 'terraform fmt terraform/' before committing"
+  exit 1
+fi
+EOF
+chmod +x .git/hooks/pre-commit
+```
+
+**EKS version upgrade fails — `Unsupported Kubernetes minor version update`**
+
+AWS does not allow skipping minor versions. Upgrade one step at a time:
+
+```
+1.29 → 1.30 → 1.31    ✅ correct
+1.29 → 1.31            ❌ InvalidParameterException
+```
+
+Change `cluster_version` in `variables.tf`, push, wait for pipeline, then repeat for the next version.
+
+**ECR `RepositoryAlreadyExistsException`**
+
+The repo was created manually outside Terraform. Two options:
+
+```bash
+# Option 1: Import into Terraform state
+terraform import aws_ecr_repository.app devops-app
+
+# Option 2: Delete from AWS Console → ECR → devops-app → Delete
+# Then re-run the pipeline — Terraform recreates it cleanly
+```
 
 **Terraform Apply skipped in Jenkins**
 
@@ -723,9 +827,9 @@ Remove any `when { branch 'main' }` conditions — branch detection is unreliabl
 Always pass `-no-color` to every Terraform command in CI:
 
 ```bash
-terraform plan    -no-color
-terraform apply   -no-color
-terraform output  -no-color -raw ecr_repository_url
+terraform plan   -no-color
+terraform apply  -no-color
+terraform output -no-color -raw ecr_repository_url
 ```
 
 **Docker build context is very large (~780 MB)**
@@ -764,6 +868,7 @@ kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/late
 | Partial failure recovery | Manual | Automatic resume |
 | Existing infra import | Not applicable | `terraform import` |
 | Accidental deletion guard | None | `null_resource` with `prevent_destroy` |
+| Version upgrades | Manual CLI | Change variable, push, pipeline handles it |
 | Cleanup | Manual per-resource | `terraform destroy` |
 | Team collaboration | Hard | S3 remote state + DynamoDB lock |
 | ANSI-safe CI output | N/A | `-no-color` on all commands |
@@ -779,6 +884,7 @@ kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/late
 - [ ] Slack notifications on pipeline success / failure
 - [ ] Blue-Green deployment strategy
 - [ ] S3 + DynamoDB remote Terraform state for team use
+- [ ] GitHub Actions alternative pipeline
 
 ---
 
